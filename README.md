@@ -19,7 +19,7 @@ The original code skeleton omitted several components.  `causal_trans.py` is now
 
 ## Quick smoke test
 
-If you do not have a real dataset ready, run one epoch on synthetic binary data:
+If you do not have a real dataset ready, run one epoch on synthetic data:
 
 ```bash
 python causal_trans.py \
@@ -58,6 +58,22 @@ python causal_trans.py \
   --image-size 128 \
   --pretrained-backbone \
   --output-dir runs/tlt_experiment
+```
+
+
+## Treatment-aware split policy
+
+By default, `--split-t1-across-splits` is `True`, so the split is performed over all images and `train`, `val` and `test` may each contain `t1` samples, matching the original simple split behavior.
+
+If you want only the training set to contain `t1`, pass `--no-split-t1-across-splits`.  In that mode the `--train-ratio` and `--val-ratio` are applied **only to t0 images**; after the t0 split is created, every `t1` image is appended to the training set, and `val`/`test` contain only `t0`.
+
+```bash
+python causal_trans.py \
+  --data-root /path/to/MTL \
+  --no-split-t1-across-splits \
+  --train-ratio 0.7 \
+  --val-ratio 0.15 \
+  --output-dir runs/tlt_t1_train_only
 ```
 
 ## Outputs

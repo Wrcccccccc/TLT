@@ -23,7 +23,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import models, transforms
 from torchvision.datasets import FakeData, ImageFolder
 
@@ -405,6 +405,9 @@ class FakeCausalData(Dataset):
     def __len__(self) -> int:
         return len(self.base)
 
+    def treatment_values(self) -> List[int]:
+        return [(idx + int(self.base[idx][1])) % 2 for idx in range(len(self.base))]
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         image, y = self.base[idx]
         t = (idx + int(y)) % 2
@@ -438,6 +441,25 @@ def _collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def split_indices_by_ratio(indices: List[int], train_ratio: float, val_ratio: float, generator: torch.Generator) -> Tuple[List[int], List[int], List[int]]:
+    """Shuffle indices and split them into train/val/test according to ratios."""
+    if len(indices) < 3:
+        raise ValueError("At least three samples are required for train/val/test splits.")
+    shuffled = torch.tensor(indices)[torch.randperm(len(indices), generator=generator)].tolist()
+    n_train = max(1, int(len(shuffled) * train_ratio))
+    n_val = max(1, int(len(shuffled) * val_ratio))
+    n_test = len(shuffled) - n_train - n_val
+    if n_test < 1:
+        n_test = 1
+        n_train = len(shuffled) - n_val - n_test
+    if n_train < 1:
+        raise ValueError("Split ratios leave no training samples; adjust --train-ratio/--val-ratio.")
+    train_indices = shuffled[:n_train]
+    val_indices = shuffled[n_train:n_train + n_val]
+    test_indices = shuffled[n_train + n_val:]
+    return train_indices, val_indices, test_indices
+
+
 def build_dataloaders(args: argparse.Namespace) -> Tuple[Dict[str, DataLoader], int]:
     train_tf = build_transforms(args.image_size, train=True)
     eval_tf = build_transforms(args.image_size, train=False)
@@ -452,28 +474,46 @@ def build_dataloaders(args: argparse.Namespace) -> Tuple[Dict[str, DataLoader], 
                 "Your MTL/class0...class4 layout supplies outcome classes, not treatment labels; "
                 "add t0/t1 markers to filenames or use --treatment-mode label-parity only for debugging."
             )
-        n_total = len(full_for_split)
     else:
         num_classes = args.num_classes
         full_for_split = FakeCausalData(args.fake_size, args.image_size, train_tf, num_classes=num_classes)
         eval_source = FakeCausalData(args.fake_size, args.image_size, eval_tf, num_classes=num_classes)
-        n_total = len(full_for_split)
+        treatment_values = full_for_split.treatment_values()
+
+    n_total = len(full_for_split)
     if n_total < 3:
         raise ValueError("Dataset must contain at least three samples for train/val/test splits.")
-    n_train = max(1, int(n_total * args.train_ratio))
-    n_val = max(1, int(n_total * args.val_ratio))
-    n_test = n_total - n_train - n_val
-    if n_test < 1:
-        n_test = 1
-        n_train = n_total - n_val - n_test
+
     generator = torch.Generator().manual_seed(args.seed)
-    train_subset, val_subset, test_subset = random_split(full_for_split, [n_train, n_val, n_test], generator=generator)
-    val_subset.dataset = eval_source
-    test_subset.dataset = eval_source
+    all_indices = list(range(n_total))
+    if args.split_t1_across_splits:
+        train_indices, val_indices, test_indices = split_indices_by_ratio(all_indices, args.train_ratio, args.val_ratio, generator)
+    else:
+        t0_indices = [idx for idx, treatment in enumerate(treatment_values) if int(treatment) == 0]
+        t1_indices = [idx for idx, treatment in enumerate(treatment_values) if int(treatment) == 1]
+        if len(t0_indices) < 3:
+            raise ValueError(
+                "--no-split-t1-across-splits requires at least three t0 samples because "
+                "train/val/test ratios are applied to t0 images only."
+            )
+        if not t1_indices:
+            print("WARNING: --no-split-t1-across-splits was set, but no t1 samples were found.")
+        train_t0, val_indices, test_indices = split_indices_by_ratio(t0_indices, args.train_ratio, args.val_ratio, generator)
+        train_indices = train_t0 + t1_indices
+        train_indices = torch.tensor(train_indices)[torch.randperm(len(train_indices), generator=generator)].tolist()
+        print(
+            "Split policy: train/val/test ratios were applied to t0 only; "
+            f"all {len(t1_indices)} t1 samples were added to train."
+        )
+
+    print(
+        f"Split sizes: train={len(train_indices)}, val={len(val_indices)}, test={len(test_indices)} "
+        f"(split_t1_across_splits={args.split_t1_across_splits})"
+    )
     loaders = {
-        "train": DataLoader(train_subset, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True, collate_fn=_collate),
-        "val": DataLoader(val_subset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=_collate),
-        "test": DataLoader(test_subset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=_collate),
+        "train": DataLoader(Subset(full_for_split, train_indices), batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True, collate_fn=_collate),
+        "val": DataLoader(Subset(eval_source, val_indices), batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=_collate),
+        "test": DataLoader(Subset(eval_source, test_indices), batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=_collate),
     }
     return loaders, num_classes
 
@@ -620,6 +660,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fake-size", type=int, default=96)
     parser.add_argument("--num-classes", type=int, default=5, help="Number of FakeData classes when --data-root is omitted.")
     parser.add_argument("--treatment-mode", choices=["filename", "label-parity", "none"], default="filename", help="How to derive binary treatment t. Use filename for t0/t1 markers, label-parity only for debugging when no treatment labels exist, or none to set all t=0.")
+    parser.add_argument("--split-t1-across-splits", action=argparse.BooleanOptionalAction, default=True, help="If true, split all samples normally so train/val/test may all contain t1. If false, apply train/val/test ratios to t0 samples only and put every t1 sample into train.")
     parser.add_argument("--pretrained-backbone", action="store_true", help="Use ImageNet ResNet-34 weights; requires cached/downloadable weights.")
     parser.add_argument("--no-attention", action="store_true", help="Disable the TLT attention block for ablation/debugging.")
     return parser.parse_args()
