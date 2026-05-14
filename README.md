@@ -9,8 +9,8 @@ The original code skeleton omitted several components.  `causal_trans.py` is now
 
 - ResNet-34 feature encoder and residual blocks.
 - TLT attention-based inference network for `q(t|x)`, `q(y|x,t)` and `q(z|x,t,y)`.
-- Decoder heads for `p(t|z)`, `p(y|z,t=0)` and `p(y|z,t=1)`.
-- Variational/auxiliary loss terms following the paper objective.
+- Multi-class decoder heads for `p(t|z)`, `p(y|z,t=0)` and `p(y|z,t=1)`.
+- Variational/auxiliary loss terms following the paper objective; outcome labels use cross-entropy, so folders such as `class0` ... `class4` are handled correctly.
 - ImageFolder/FakeData data loaders, train-time augmentation and evaluation preprocessing.
 - Random seed control.
 - AdamW optimizer, cosine learning-rate schedule and gradient clipping.
@@ -25,6 +25,7 @@ If you do not have a real dataset ready, run one epoch on synthetic binary data:
 python causal_trans.py \
   --epochs 1 \
   --fake-size 32 \
+  --num-classes 5 \
   --image-size 64 \
   --batch-size 4 \
   --workers 0 \
@@ -47,11 +48,11 @@ data_root/
     image_t1_0004.jpg
 ```
 
-The parent directory supplies the binary outcome label `y`; filenames or parent paths supply the binary treatment `t` when they contain `t0`, `t1`, `t=0`, `t=1`, `treatment0` or `treatment1`.  If no treatment marker is found, `t` defaults to `0` so plain ImageFolder datasets still run for debugging.
+The parent directory supplies the multi-class outcome label `y`; for your `MTL/class0` ... `MTL/class4` layout, the code automatically detects `num_classes=5` and trains with multi-class cross-entropy.  Filenames or parent paths supply the binary treatment `t` when they contain `t0`, `t1`, `t=0`, `t=1`, `treatment0` or `treatment1`.  If no treatment marker is found, `t` defaults to `0`; use `--treatment-mode label-parity` only as a debugging fallback when your dataset has no treatment labels at all.
 
 ```bash
 python causal_trans.py \
-  --data-root /path/to/data_root \
+  --data-root /path/to/MTL \
   --epochs 50 \
   --batch-size 32 \
   --image-size 128 \

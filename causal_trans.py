@@ -171,14 +171,20 @@ class Attention(nn.Module):
 class TLTEncoder(nn.Module):
     """Inference network for q(t|x), q(y|x,t), and q(z|x,t,y)."""
 
-    def __init__(self, pretrained_backbone: bool = True, latent_channels: int = 512, use_attention: bool = True) -> None:
+    def __init__(
+        self,
+        pretrained_backbone: bool = True,
+        latent_channels: int = 512,
+        use_attention: bool = True,
+        num_classes: int = 2,
+    ) -> None:
         super().__init__()
         self.emb = ResnetEncoder(pretrained=pretrained_backbone)
         channels = self.emb.out_channels
         self.logits_t = ConvHead(channels, 1)
         self.hqy_t0 = ResBlocks(1, channels)
         self.hqy_t1 = ResBlocks(1, channels)
-        self.qy = ConvHead(channels, 1)
+        self.qy = ConvHead(channels, num_classes)
         self.attn = Attention(channels, channels, channels, out_channels=channels) if use_attention else None
         self.hqz = ResBlocks(1, channels)
         self.residual_z = nn.Conv2d(channels, latent_channels, kernel_size=1, bias=False)
@@ -204,7 +210,7 @@ class TLTEncoder(nn.Module):
             t_gate = t.float().view(-1, 1, 1, 1)
         query = t_gate * h_t1 + (1.0 - t_gate) * h_t0
         qy_logits = self.qy(query)
-        qy_prob = torch.sigmoid(qy_logits)
+        qy_prob = torch.softmax(qy_logits, dim=1)
         z_features = self.attn(query, h, h) if self.attn is not None else query
         z_features = self.hqz(z_features) + self.residual_z(h)
         mu0, logvar0 = self.muq_t0(z_features), self.logvarq_t0(z_features).clamp(-10.0, 10.0)
@@ -226,15 +232,15 @@ class TLTEncoder(nn.Module):
 class TLTDecoder(nn.Module):
     """Model network for p(x|z), p(t|z), p(y|z,t=0) and p(y|z,t=1)."""
 
-    def __init__(self, latent_channels: int = 512) -> None:
+    def __init__(self, latent_channels: int = 512, num_classes: int = 2) -> None:
         super().__init__()
         self.px = nn.Sequential(
             ResBlocks(1, latent_channels),
             nn.Conv2d(latent_channels, latent_channels, kernel_size=3, padding=1),
         )
         self.pt = ConvHead(latent_channels, 1)
-        self.py_t0 = ConvHead(latent_channels, 1)
-        self.py_t1 = ConvHead(latent_channels, 1)
+        self.py_t0 = ConvHead(latent_channels, num_classes)
+        self.py_t1 = ConvHead(latent_channels, num_classes)
 
     def forward(self, z: torch.Tensor, t: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         px_features = self.px(z)
@@ -252,19 +258,20 @@ class TLTDecoder(nn.Module):
             "py_t0_logits": y0_logits,
             "py_t1_logits": y1_logits,
             "y_logits": y_logits,
-            "y_prob": torch.sigmoid(y_logits),
-            "y0_prob": torch.sigmoid(y0_logits),
-            "y1_prob": torch.sigmoid(y1_logits),
+            "y_prob": torch.softmax(y_logits, dim=1),
+            "y0_prob": torch.softmax(y0_logits, dim=1),
+            "y1_prob": torch.softmax(y1_logits, dim=1),
         }
 
 
 class CausalTransformer(nn.Module):
     """End-to-end Treatment Learning Transformer."""
 
-    def __init__(self, pretrained_backbone: bool = True, use_attention: bool = True) -> None:
+    def __init__(self, pretrained_backbone: bool = True, use_attention: bool = True, num_classes: int = 2) -> None:
         super().__init__()
-        self.encoder = TLTEncoder(pretrained_backbone=pretrained_backbone, use_attention=use_attention)
-        self.decoder = TLTDecoder()
+        self.num_classes = num_classes
+        self.encoder = TLTEncoder(pretrained_backbone=pretrained_backbone, use_attention=use_attention, num_classes=num_classes)
+        self.decoder = TLTDecoder(num_classes=num_classes)
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         enc = self.encoder(batch["x"], batch.get("t"))
@@ -276,41 +283,41 @@ class CEVAE(CausalTransformer):
     """Compatibility wrapper for the original constructor signature."""
 
     def __init__(self, *args: Any, pretrained_backbone: bool = False, use_attention: bool = False, **kwargs: Any) -> None:
-        super().__init__(pretrained_backbone=pretrained_backbone, use_attention=use_attention)
+        super().__init__(pretrained_backbone=pretrained_backbone, use_attention=use_attention, num_classes=kwargs.pop("num_classes", 2))
 
 
 class CEVAE_Att(CausalTransformer):
     """Compatibility wrapper that enables the attention path by default."""
 
     def __init__(self, *args: Any, pretrained_backbone: bool = False, use_attention: bool = True, **kwargs: Any) -> None:
-        super().__init__(pretrained_backbone=pretrained_backbone, use_attention=use_attention)
+        super().__init__(pretrained_backbone=pretrained_backbone, use_attention=use_attention, num_classes=kwargs.pop("num_classes", 2))
 
 
 class Causal_Transformer(CausalTransformer):
     """Compatibility wrapper matching the paper-code class name."""
 
     def __init__(self, *args: Any, pretrained_backbone: bool = False, use_attention: bool = True, **kwargs: Any) -> None:
-        super().__init__(pretrained_backbone=pretrained_backbone, use_attention=use_attention)
+        super().__init__(pretrained_backbone=pretrained_backbone, use_attention=use_attention, num_classes=kwargs.pop("num_classes", 2))
 
 
 class Encoder(TLTEncoder):
     def __init__(self, *args: Any, pretrained_backbone: bool = False, use_attention: bool = False, **kwargs: Any) -> None:
-        super().__init__(pretrained_backbone=pretrained_backbone, use_attention=use_attention)
+        super().__init__(pretrained_backbone=pretrained_backbone, use_attention=use_attention, num_classes=kwargs.pop("num_classes", 2))
 
 
 class Encoder_v2(TLTEncoder):
     def __init__(self, *args: Any, pretrained_backbone: bool = False, use_attention: bool = True, **kwargs: Any) -> None:
-        super().__init__(pretrained_backbone=pretrained_backbone, use_attention=use_attention)
+        super().__init__(pretrained_backbone=pretrained_backbone, use_attention=use_attention, num_classes=kwargs.pop("num_classes", 2))
 
 
 class Encoder_v3(TLTEncoder):
     def __init__(self, *args: Any, pretrained_backbone: bool = False, use_attention: bool = True, **kwargs: Any) -> None:
-        super().__init__(pretrained_backbone=pretrained_backbone, use_attention=use_attention)
+        super().__init__(pretrained_backbone=pretrained_backbone, use_attention=use_attention, num_classes=kwargs.pop("num_classes", 2))
 
 
 class Decoder(TLTDecoder):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__()
+        super().__init__(num_classes=kwargs.pop("num_classes", 2))
 
 
 def tlt_loss(
@@ -325,11 +332,11 @@ def tlt_loss(
     classification terms: decoder likelihood p(y|z,t), decoder p(t|z), encoder
     q(y|x,t), encoder q(t|x), and a standard Normal prior KL for z.
     """
-    y = batch["y"].float().view(-1, 1)
+    y = batch["y"].long().view(-1)
     t = batch["t"].float().view(-1, 1)
-    recon_y = F.binary_cross_entropy_with_logits(outputs["y_logits"], y)
+    recon_y = F.cross_entropy(outputs["y_logits"], y)
     model_t = F.binary_cross_entropy_with_logits(outputs["pt_logits"], t)
-    aux_y = F.binary_cross_entropy_with_logits(outputs["qy_logits"], y)
+    aux_y = F.cross_entropy(outputs["qy_logits"], y)
     aux_t = F.binary_cross_entropy_with_logits(outputs["qt_logits"], t)
     kl_z = -0.5 * torch.mean(1.0 + outputs["logvar"] - outputs["mu"].pow(2) - outputs["logvar"].exp())
     elbo = recon_y + model_t + kl_weight * kl_z
@@ -358,8 +365,25 @@ class CausalImageFolder(Dataset):
 
     treatment_pattern = re.compile(r"(?:^|[_\-\/])(?:t|treatment)[=_-]?([01])(?:$|[_\-.\/])", re.IGNORECASE)
 
-    def __init__(self, root: str, transform: transforms.Compose) -> None:
+    def __init__(self, root: str, transform: transforms.Compose, treatment_mode: str = "filename") -> None:
         self.dataset = ImageFolder(root=root, transform=transform)
+        self.treatment_mode = treatment_mode
+        self.classes = self.dataset.classes
+
+    @property
+    def num_classes(self) -> int:
+        return len(self.classes)
+
+    def treatment_from_path(self, path: str, y: int) -> int:
+        if self.treatment_mode == "label-parity":
+            return int(y) % 2
+        if self.treatment_mode == "none":
+            return 0
+        match = self.treatment_pattern.search(path.replace(os.sep, "/"))
+        return int(match.group(1)) if match else 0
+
+    def treatment_values(self) -> List[int]:
+        return [self.treatment_from_path(path, y) for path, y in self.dataset.samples]
 
     def __len__(self) -> int:
         return len(self.dataset)
@@ -367,16 +391,16 @@ class CausalImageFolder(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         image, y = self.dataset[idx]
         path = self.dataset.samples[idx][0]
-        match = self.treatment_pattern.search(path.replace(os.sep, "/"))
-        t = int(match.group(1)) if match else 0
-        return {"x": image, "y": torch.tensor(y, dtype=torch.float32), "t": torch.tensor(t, dtype=torch.float32), "path": path}
+        t = self.treatment_from_path(path, y)
+        return {"x": image, "y": torch.tensor(y, dtype=torch.long), "t": torch.tensor(t, dtype=torch.float32), "path": path}
 
 
 class FakeCausalData(Dataset):
     """Small deterministic dataset for smoke tests when no real data is present."""
 
-    def __init__(self, size: int, image_size: int, transform: transforms.Compose) -> None:
-        self.base = FakeData(size=size, image_size=(3, image_size, image_size), num_classes=2, transform=transform)
+    def __init__(self, size: int, image_size: int, transform: transforms.Compose, num_classes: int = 5) -> None:
+        self.num_classes = num_classes
+        self.base = FakeData(size=size, image_size=(3, image_size, image_size), num_classes=num_classes, transform=transform)
 
     def __len__(self) -> int:
         return len(self.base)
@@ -384,7 +408,7 @@ class FakeCausalData(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         image, y = self.base[idx]
         t = (idx + int(y)) % 2
-        return {"x": image, "y": torch.tensor(y, dtype=torch.float32), "t": torch.tensor(t, dtype=torch.float32), "path": str(idx)}
+        return {"x": image, "y": torch.tensor(y, dtype=torch.long), "t": torch.tensor(t, dtype=torch.float32), "path": str(idx)}
 
 
 def build_transforms(image_size: int, train: bool) -> transforms.Compose:
@@ -414,16 +438,25 @@ def _collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def build_dataloaders(args: argparse.Namespace) -> Dict[str, DataLoader]:
+def build_dataloaders(args: argparse.Namespace) -> Tuple[Dict[str, DataLoader], int]:
     train_tf = build_transforms(args.image_size, train=True)
     eval_tf = build_transforms(args.image_size, train=False)
     if args.data_root:
-        full_for_split = CausalImageFolder(args.data_root, transform=train_tf)
-        eval_source = CausalImageFolder(args.data_root, transform=eval_tf)
+        full_for_split = CausalImageFolder(args.data_root, transform=train_tf, treatment_mode=args.treatment_mode)
+        eval_source = CausalImageFolder(args.data_root, transform=eval_tf, treatment_mode=args.treatment_mode)
+        num_classes = full_for_split.num_classes
+        treatment_values = full_for_split.treatment_values()
+        if len(set(treatment_values)) < 2:
+            print(
+                "WARNING: all inferred treatment labels are identical. "
+                "Your MTL/class0...class4 layout supplies outcome classes, not treatment labels; "
+                "add t0/t1 markers to filenames or use --treatment-mode label-parity only for debugging."
+            )
         n_total = len(full_for_split)
     else:
-        full_for_split = FakeCausalData(args.fake_size, args.image_size, train_tf)
-        eval_source = FakeCausalData(args.fake_size, args.image_size, eval_tf)
+        num_classes = args.num_classes
+        full_for_split = FakeCausalData(args.fake_size, args.image_size, train_tf, num_classes=num_classes)
+        eval_source = FakeCausalData(args.fake_size, args.image_size, eval_tf, num_classes=num_classes)
         n_total = len(full_for_split)
     if n_total < 3:
         raise ValueError("Dataset must contain at least three samples for train/val/test splits.")
@@ -437,11 +470,12 @@ def build_dataloaders(args: argparse.Namespace) -> Dict[str, DataLoader]:
     train_subset, val_subset, test_subset = random_split(full_for_split, [n_train, n_val, n_test], generator=generator)
     val_subset.dataset = eval_source
     test_subset.dataset = eval_source
-    return {
+    loaders = {
         "train": DataLoader(train_subset, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True, collate_fn=_collate),
         "val": DataLoader(val_subset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=_collate),
         "test": DataLoader(test_subset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=_collate),
     }
+    return loaders, num_classes
 
 
 def to_device(batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
@@ -449,11 +483,11 @@ def to_device(batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
 
 
 def compute_metrics(outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor], loss_parts: Dict[str, torch.Tensor]) -> BatchMetrics:
-    y = batch["y"].float().view(-1, 1)
+    y = batch["y"].long().view(-1)
     t = batch["t"].float().view(-1, 1)
-    y_pred = (outputs["y_prob"] >= 0.5).float()
+    y_pred = torch.argmax(outputs["y_prob"], dim=1)
     t_pred = (outputs["qt_prob"] >= 0.5).float()
-    ate = torch.mean(outputs["y1_prob"] - outputs["y0_prob"]).abs()
+    ate = torch.mean(torch.abs(outputs["y1_prob"] - outputs["y0_prob"]))
     return BatchMetrics(
         loss=float(loss_parts["loss"].item()),
         elbo=float(loss_parts["elbo"].item()),
@@ -533,8 +567,9 @@ def train(args: argparse.Namespace) -> Dict[str, float]:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
-    loaders = build_dataloaders(args)
-    model = CausalTransformer(pretrained_backbone=args.pretrained_backbone, use_attention=not args.no_attention).to(device)
+    loaders, num_classes = build_dataloaders(args)
+    print(f"Detected/using {num_classes} outcome classes. Treatment mode: {args.treatment_mode}")
+    model = CausalTransformer(pretrained_backbone=args.pretrained_backbone, use_attention=not args.no_attention, num_classes=num_classes).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
     (out_dir / "config.json").write_text(json.dumps(vars(args), indent=2, ensure_ascii=False))
@@ -566,7 +601,7 @@ def train(args: argparse.Namespace) -> Dict[str, float]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train/evaluate a Treatment Learning Transformer for binary noisy image classification.")
+    parser = argparse.ArgumentParser(description="Train/evaluate a Treatment Learning Transformer for noisy image classification.")
     parser.add_argument("--data-root", type=str, default="", help="ImageFolder root. If omitted, a FakeData smoke-test dataset is used.")
     parser.add_argument("--output-dir", type=str, default="runs/tlt", help="Directory for checkpoints, metrics and loss curves.")
     parser.add_argument("--epochs", type=int, default=10)
@@ -583,6 +618,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--fake-size", type=int, default=96)
+    parser.add_argument("--num-classes", type=int, default=5, help="Number of FakeData classes when --data-root is omitted.")
+    parser.add_argument("--treatment-mode", choices=["filename", "label-parity", "none"], default="filename", help="How to derive binary treatment t. Use filename for t0/t1 markers, label-parity only for debugging when no treatment labels exist, or none to set all t=0.")
     parser.add_argument("--pretrained-backbone", action="store_true", help="Use ImageNet ResNet-34 weights; requires cached/downloadable weights.")
     parser.add_argument("--no-attention", action="store_true", help="Disable the TLT attention block for ablation/debugging.")
     return parser.parse_args()
