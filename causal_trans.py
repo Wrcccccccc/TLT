@@ -16,6 +16,8 @@ import math
 import os
 import random
 import re
+
+import numpy as np
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -25,7 +27,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import models, transforms
-from torchvision.datasets import FakeData, ImageFolder
+from torchvision.datasets import ImageFolder
+from torchvision.transforms import functional as TF
 
 
 
@@ -105,10 +108,15 @@ class ConvHead(nn.Module):
 class ResnetEncoder(nn.Module):
     """ResNet-34 feature extractor that returns the final 512-channel feature map."""
 
-    def __init__(self, pretrained: bool = True) -> None:
+    def __init__(self, pretrained: bool = True, in_channels: int = 3) -> None:
         super().__init__()
         weights = models.ResNet34_Weights.IMAGENET1K_V1 if pretrained else None
         backbone = models.resnet34(weights=weights)
+        if in_channels != 3:
+            conv1 = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
+            if weights is not None and in_channels == 1:
+                conv1.weight.data.copy_(backbone.conv1.weight.data.mean(dim=1, keepdim=True))
+            backbone.conv1 = conv1
         self.stem = nn.Sequential(
             backbone.conv1,
             backbone.bn1,
@@ -179,8 +187,9 @@ class TLTEncoder(nn.Module):
         num_classes: int = 2,
     ) -> None:
         super().__init__()
-        self.emb = ResnetEncoder(pretrained=pretrained_backbone)
-        channels = self.emb.out_channels
+        self.rgb_emb = ResnetEncoder(pretrained=pretrained_backbone, in_channels=3)
+        self.depth_emb = ResnetEncoder(pretrained=False, in_channels=1)
+        channels = self.rgb_emb.out_channels
         self.logits_t = ConvHead(channels, 1)
         self.hqy_t0 = ResBlocks(1, channels)
         self.hqy_t1 = ResBlocks(1, channels)
@@ -188,6 +197,8 @@ class TLTEncoder(nn.Module):
         self.attn = Attention(channels, channels, channels, out_channels=channels) if use_attention else None
         self.hqz = ResBlocks(1, channels)
         self.residual_z = nn.Conv2d(channels, latent_channels, kernel_size=1, bias=False)
+        self.prior_mu = nn.Sequential(ResBlocks(1, latent_channels, use_bias=False), nn.Conv2d(latent_channels, latent_channels, 1))
+        self.prior_logvar = nn.Sequential(ResBlocks(1, latent_channels), nn.Conv2d(latent_channels, latent_channels, 1))
         self.muq_t0 = nn.Sequential(ResBlocks(1, latent_channels, use_bias=False), nn.Conv2d(latent_channels, latent_channels, 1))
         self.logvarq_t0 = nn.Sequential(ResBlocks(1, latent_channels), nn.Conv2d(latent_channels, latent_channels, 1))
         self.muq_t1 = nn.Sequential(ResBlocks(1, latent_channels, use_bias=False), nn.Conv2d(latent_channels, latent_channels, 1))
@@ -198,8 +209,9 @@ class TLTEncoder(nn.Module):
         std = torch.exp(0.5 * logvar)
         return mu + torch.randn_like(std) * std
 
-    def forward(self, x: torch.Tensor, t: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
-        h = self.emb(x)
+    def forward(self, x: torch.Tensor, depth: torch.Tensor, t: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        h = self.rgb_emb(x)
+        depth_h = self.depth_emb(depth)
         qt_logits = self.logits_t(h)
         qt_prob = torch.sigmoid(qt_logits)
         h_t0 = self.hqy_t0(h)
@@ -211,8 +223,10 @@ class TLTEncoder(nn.Module):
         query = t_gate * h_t1 + (1.0 - t_gate) * h_t0
         qy_logits = self.qy(query)
         qy_prob = torch.softmax(qy_logits, dim=1)
-        z_features = self.attn(query, h, h) if self.attn is not None else query
-        z_features = self.hqz(z_features) + self.residual_z(h)
+        z_features = self.attn(query, depth_h, depth_h) if self.attn is not None else query
+        z_features = self.hqz(z_features) + self.residual_z(depth_h)
+        prior_mu = self.prior_mu(self.residual_z(depth_h))
+        prior_logvar = self.prior_logvar(self.residual_z(depth_h)).clamp(-10.0, 10.0)
         mu0, logvar0 = self.muq_t0(z_features), self.logvarq_t0(z_features).clamp(-10.0, 10.0)
         mu1, logvar1 = self.muq_t1(z_features), self.logvarq_t1(z_features).clamp(-10.0, 10.0)
         mu = t_gate * mu1 + (1.0 - t_gate) * mu0
@@ -222,6 +236,8 @@ class TLTEncoder(nn.Module):
             "z": z,
             "mu": mu,
             "logvar": logvar,
+            "prior_mu": prior_mu,
+            "prior_logvar": prior_logvar,
             "qt_logits": qt_logits,
             "qt_prob": qt_prob,
             "qy_logits": qy_logits,
@@ -274,7 +290,7 @@ class CausalTransformer(nn.Module):
         self.decoder = TLTDecoder(num_classes=num_classes)
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        enc = self.encoder(batch["x"], batch.get("t"))
+        enc = self.encoder(batch["x"], batch["depth"], batch.get("t"))
         dec = self.decoder(enc["z"], batch.get("t"))
         return {**enc, **dec}
 
@@ -330,7 +346,7 @@ def tlt_loss(
 
     The implementation follows the paper's Eq. (5) with practical image
     classification terms: decoder likelihood p(y|z,t), decoder p(t|z), encoder
-    q(y|x,t), encoder q(t|x), and a standard Normal prior KL for z.
+    q(y|x,t), encoder q(t|x), and a depth-conditioned Gaussian prior KL for z.
     """
     y = batch["y"].long().view(-1)
     t = batch["t"].float().view(-1, 1)
@@ -338,7 +354,14 @@ def tlt_loss(
     model_t = F.binary_cross_entropy_with_logits(outputs["pt_logits"], t)
     aux_y = F.cross_entropy(outputs["qy_logits"], y)
     aux_t = F.binary_cross_entropy_with_logits(outputs["qt_logits"], t)
-    kl_z = -0.5 * torch.mean(1.0 + outputs["logvar"] - outputs["mu"].pow(2) - outputs["logvar"].exp())
+    posterior_var = outputs["logvar"].exp()
+    prior_var = outputs["prior_logvar"].exp()
+    kl_z = 0.5 * torch.mean(
+        outputs["prior_logvar"]
+        - outputs["logvar"]
+        + (posterior_var + (outputs["mu"] - outputs["prior_mu"]).pow(2)) / prior_var
+        - 1.0
+    )
     elbo = recon_y + model_t + kl_weight * kl_z
     aux = aux_weight * (aux_y + aux_t)
     loss = elbo + aux
@@ -354,19 +377,27 @@ def tlt_loss(
     return loss, parts
 
 
-class CausalImageFolder(Dataset):
-    """ImageFolder wrapper returning image x, class label y and treatment t.
+class RGBDepthImageFolder(Dataset):
+    """ImageFolder-style RGB dataset with a paired ``.npy`` depth map per image.
 
-    Treatment labels are read from filenames or parent directories containing one
-    of: ``t0``, ``t1``, ``t=0``, ``t=1``, ``treatment0`` or ``treatment1``.  If no
-    treatment marker exists, t defaults to 0 so ordinary ImageFolder datasets can
-    still be used for debugging.
+    Class folders provide the outcome label ``y``.  The depth path is resolved by
+    replacing the RGB suffix with ``.npy`` next to the RGB image, or by mirroring
+    the RGB relative path under ``depth_root`` when that argument is provided.
     """
 
-    treatment_pattern = re.compile(r"(?:^|[_\-\/])(?:t|treatment)[=_-]?([01])(?:$|[_\-.\/])", re.IGNORECASE)
+    treatment_pattern = re.compile(r"(?:^|[_\-/])(?:t|treatment)[=_-]?([01])(?:$|[_\-./])", re.IGNORECASE)
 
-    def __init__(self, root: str, transform: transforms.Compose, treatment_mode: str = "filename") -> None:
-        self.dataset = ImageFolder(root=root, transform=transform)
+    def __init__(
+        self,
+        root: str,
+        transform: "PairedRGBDepthTransform",
+        depth_root: Optional[str] = None,
+        treatment_mode: str = "filename",
+    ) -> None:
+        self.root = Path(root)
+        self.depth_root = Path(depth_root) if depth_root else None
+        self.dataset = ImageFolder(root=root)
+        self.transform = transform
         self.treatment_mode = treatment_mode
         self.classes = self.dataset.classes
 
@@ -385,61 +416,101 @@ class CausalImageFolder(Dataset):
     def treatment_values(self) -> List[int]:
         return [self.treatment_from_path(path, y) for path, y in self.dataset.samples]
 
+    def depth_path_for_rgb(self, rgb_path: str) -> Path:
+        rgb = Path(rgb_path)
+        if self.depth_root is None:
+            candidates = [rgb.with_suffix(".npy")]
+        else:
+            rel = rgb.relative_to(self.root)
+            candidates = [self.depth_root / rel.with_suffix(".npy"), self.depth_root / rel.name.replace(rgb.suffix, ".npy")]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        searched = ", ".join(str(candidate) for candidate in candidates)
+        raise FileNotFoundError(f"No paired depth .npy found for RGB image {rgb_path}. Searched: {searched}")
+
     def __len__(self) -> int:
         return len(self.dataset)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        image, y = self.dataset[idx]
-        path = self.dataset.samples[idx][0]
-        t = self.treatment_from_path(path, y)
-        return {"x": image, "y": torch.tensor(y, dtype=torch.long), "t": torch.tensor(t, dtype=torch.float32), "path": path}
+        rgb_path, y = self.dataset.samples[idx]
+        image = self.dataset.loader(rgb_path)
+        depth = np.load(self.depth_path_for_rgb(rgb_path))
+        x, depth_tensor = self.transform(image, depth)
+        t = self.treatment_from_path(rgb_path, y)
+        return {
+            "x": x,
+            "depth": depth_tensor,
+            "y": torch.tensor(y, dtype=torch.long),
+            "t": torch.tensor(t, dtype=torch.float32),
+            "path": rgb_path,
+        }
 
 
-class FakeCausalData(Dataset):
-    """Small deterministic dataset for smoke tests when no real data is present."""
-
-    def __init__(self, size: int, image_size: int, transform: transforms.Compose, num_classes: int = 5) -> None:
-        self.num_classes = num_classes
-        self.base = FakeData(size=size, image_size=(3, image_size, image_size), num_classes=num_classes, transform=transform)
-
-    def __len__(self) -> int:
-        return len(self.base)
-
-    def treatment_values(self) -> List[int]:
-        return [(idx + int(self.base[idx][1])) % 2 for idx in range(len(self.base))]
-
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        image, y = self.base[idx]
-        t = (idx + int(y)) % 2
-        return {"x": image, "y": torch.tensor(y, dtype=torch.long), "t": torch.tensor(t, dtype=torch.float32), "path": str(idx)}
+# Backward-compatible name for callers that imported the old dataset class.
+CausalImageFolder = RGBDepthImageFolder
 
 
-def build_transforms(image_size: int, train: bool) -> transforms.Compose:
-    ops: List[Any] = []
-    if train:
-        ops.extend([
-            transforms.RandomResizedCrop(image_size, scale=(0.8, 1.0)),
-            transforms.RandomHorizontalFlip(),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
-        ])
-    else:
-        ops.extend([transforms.Resize(int(image_size * 1.15)), transforms.CenterCrop(image_size)])
-    ops.extend([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=models.ResNet34_Weights.IMAGENET1K_V1.transforms().mean,
-                             std=models.ResNet34_Weights.IMAGENET1K_V1.transforms().std),
-    ])
-    return transforms.Compose(ops)
+class PairedRGBDepthTransform:
+    """Apply aligned spatial preprocessing to RGB images and depth arrays."""
+
+    def __init__(self, image_size: int, train: bool) -> None:
+        self.image_size = image_size
+        self.train = train
+        self.rgb_mean = models.ResNet34_Weights.IMAGENET1K_V1.transforms().mean
+        self.rgb_std = models.ResNet34_Weights.IMAGENET1K_V1.transforms().std
+        self.color_jitter = transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05)
+
+    @staticmethod
+    def depth_to_tensor(depth: np.ndarray) -> torch.Tensor:
+        depth = np.nan_to_num(depth.astype("float32"), nan=0.0, posinf=0.0, neginf=0.0)
+        if depth.ndim == 2:
+            tensor = torch.from_numpy(depth).unsqueeze(0)
+        elif depth.ndim == 3:
+            tensor = torch.from_numpy(depth)
+            if tensor.shape[0] not in (1, 3):
+                tensor = tensor.permute(2, 0, 1)
+            tensor = tensor[:1]
+        else:
+            raise ValueError(f"Depth array must be 2D or 3D, got shape {depth.shape}")
+        min_val, max_val = tensor.amin(), tensor.amax()
+        if torch.isfinite(max_val - min_val) and (max_val - min_val) > 0:
+            tensor = (tensor - min_val) / (max_val - min_val)
+        return tensor.float()
+
+    def __call__(self, image: Any, depth: np.ndarray) -> Tuple[torch.Tensor, torch.Tensor]:
+        depth_tensor = self.depth_to_tensor(depth)
+        if self.train:
+            i, j, h, w = transforms.RandomResizedCrop.get_params(image, scale=(0.8, 1.0), ratio=(3.0 / 4.0, 4.0 / 3.0))
+            image = TF.resized_crop(image, i, j, h, w, [self.image_size, self.image_size], interpolation=TF.InterpolationMode.BILINEAR)
+            depth_tensor = TF.resized_crop(depth_tensor, i, j, h, w, [self.image_size, self.image_size], interpolation=TF.InterpolationMode.BILINEAR)
+            if random.random() < 0.5:
+                image = TF.hflip(image)
+                depth_tensor = TF.hflip(depth_tensor)
+            image = self.color_jitter(image)
+        else:
+            resize_size = int(self.image_size * 1.15)
+            image = TF.resize(image, resize_size, interpolation=TF.InterpolationMode.BILINEAR)
+            depth_tensor = TF.resize(depth_tensor, resize_size, interpolation=TF.InterpolationMode.BILINEAR)
+            image = TF.center_crop(image, [self.image_size, self.image_size])
+            depth_tensor = TF.center_crop(depth_tensor, [self.image_size, self.image_size])
+        rgb_tensor = TF.to_tensor(image)
+        rgb_tensor = TF.normalize(rgb_tensor, mean=self.rgb_mean, std=self.rgb_std)
+        return rgb_tensor, depth_tensor
+
+
+def build_transforms(image_size: int, train: bool) -> PairedRGBDepthTransform:
+    return PairedRGBDepthTransform(image_size=image_size, train=train)
 
 
 def _collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {
         "x": torch.stack([item["x"] for item in batch]),
+        "depth": torch.stack([item["depth"] for item in batch]),
         "y": torch.stack([item["y"] for item in batch]),
         "t": torch.stack([item["t"] for item in batch]),
         "path": [item["path"] for item in batch],
     }
-
 
 def split_indices_by_ratio(indices: List[int], train_ratio: float, val_ratio: float, generator: torch.Generator) -> Tuple[List[int], List[int], List[int]]:
     """Shuffle indices and split them into train/val/test according to ratios."""
@@ -461,24 +532,30 @@ def split_indices_by_ratio(indices: List[int], train_ratio: float, val_ratio: fl
 
 
 def build_dataloaders(args: argparse.Namespace) -> Tuple[Dict[str, DataLoader], int]:
+    if not args.data_root:
+        raise ValueError("--data-root is required because FakeData support has been removed.")
     train_tf = build_transforms(args.image_size, train=True)
     eval_tf = build_transforms(args.image_size, train=False)
-    if args.data_root:
-        full_for_split = CausalImageFolder(args.data_root, transform=train_tf, treatment_mode=args.treatment_mode)
-        eval_source = CausalImageFolder(args.data_root, transform=eval_tf, treatment_mode=args.treatment_mode)
-        num_classes = full_for_split.num_classes
-        treatment_values = full_for_split.treatment_values()
-        if len(set(treatment_values)) < 2:
-            print(
-                "WARNING: all inferred treatment labels are identical. "
-                "Your MTL/class0...class4 layout supplies outcome classes, not treatment labels; "
-                "add t0/t1 markers to filenames or use --treatment-mode label-parity only for debugging."
-            )
-    else:
-        num_classes = args.num_classes
-        full_for_split = FakeCausalData(args.fake_size, args.image_size, train_tf, num_classes=num_classes)
-        eval_source = FakeCausalData(args.fake_size, args.image_size, eval_tf, num_classes=num_classes)
-        treatment_values = full_for_split.treatment_values()
+    full_for_split = RGBDepthImageFolder(
+        args.data_root,
+        transform=train_tf,
+        depth_root=args.depth_root,
+        treatment_mode=args.treatment_mode,
+    )
+    eval_source = RGBDepthImageFolder(
+        args.data_root,
+        transform=eval_tf,
+        depth_root=args.depth_root,
+        treatment_mode=args.treatment_mode,
+    )
+    num_classes = full_for_split.num_classes
+    treatment_values = full_for_split.treatment_values()
+    if len(set(treatment_values)) < 2:
+        print(
+            "WARNING: all inferred treatment labels are identical. "
+            "Your class folders supply outcome classes, not treatment labels; "
+            "add t0/t1 markers to filenames or use --treatment-mode label-parity only for debugging."
+        )
 
     n_total = len(full_for_split)
     if n_total < 3:
@@ -642,7 +719,8 @@ def train(args: argparse.Namespace) -> Dict[str, float]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train/evaluate a Treatment Learning Transformer for noisy image classification.")
-    parser.add_argument("--data-root", type=str, default="", help="ImageFolder root. If omitted, a FakeData smoke-test dataset is used.")
+    parser.add_argument("--data-root", type=str, required=True, help="RGB ImageFolder root containing class subdirectories.")
+    parser.add_argument("--depth-root", type=str, default="", help="Optional root for paired .npy depth maps. If omitted, each depth file is expected next to its RGB image with the same stem.")
     parser.add_argument("--output-dir", type=str, default="runs/tlt", help="Directory for checkpoints, metrics and loss curves.")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=16)
@@ -657,8 +735,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-ratio", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--fake-size", type=int, default=96)
-    parser.add_argument("--num-classes", type=int, default=5, help="Number of FakeData classes when --data-root is omitted.")
     parser.add_argument("--treatment-mode", choices=["filename", "label-parity", "none"], default="filename", help="How to derive binary treatment t. Use filename for t0/t1 markers, label-parity only for debugging when no treatment labels exist, or none to set all t=0.")
     parser.add_argument("--split-t1-across-splits", action=argparse.BooleanOptionalAction, default=True, help="If true, split all samples normally so train/val/test may all contain t1. If false, apply train/val/test ratios to t0 samples only and put every t1 sample into train.")
     parser.add_argument("--pretrained-backbone", action="store_true", help="Use ImageNet ResNet-34 weights; requires cached/downloadable weights.")

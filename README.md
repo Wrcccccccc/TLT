@@ -1,65 +1,55 @@
 # Treatment Learning Transformer (TLT)
 
-This repository contains a cleaned-up, runnable implementation of **Treatment Learning Causal Transformer for Noisy Image Classification** (WACV 2023):
+This repository contains a cleaned-up, runnable implementation of **Treatment Learning Causal Transformer for Noisy Image Classification** (WACV 2023), extended for paired RGB + depth inputs:
 
 - paper: <https://openaccess.thecvf.com/content/WACV2023/papers/Yang_Treatment_Learning_Causal_Transformer_for_Noisy_Image_Classification_WACV_2023_paper.pdf>
 - local copy: `水边的猫Yang_Treatment_Learning_Causal_Transformer_for_Noisy_Image_Classification_WACV_2023_paper.pdf`
 
-The original code skeleton omitted several components.  `causal_trans.py` is now self-contained and includes:
+`causal_trans.py` is self-contained and includes:
 
-- ResNet-34 feature encoder and residual blocks.
-- TLT attention-based inference network for `q(t|x)`, `q(y|x,t)` and `q(z|x,t,y)`.
+- RGB and depth ResNet-34 branches.
+- A cross-modal TLT encoder: RGB-derived treatment/outcome features remain the Query, while depth features provide Key and Value for attention.
+- A depth-conditioned latent prior `p(z|depth)=N(mu(f_depth), var(f_depth))` instead of a fixed standard Normal prior.
 - Multi-class decoder heads for `p(t|z)`, `p(y|z,t=0)` and `p(y|z,t=1)`.
 - Variational/auxiliary loss terms following the paper objective; outcome labels use cross-entropy, so folders such as `class0` ... `class4` are handled correctly.
-- ImageFolder/FakeData data loaders, train-time augmentation and evaluation preprocessing.
-- Random seed control.
-- AdamW optimizer, cosine learning-rate schedule and gradient clipping.
-- Train/validation/test loops.
-- Checkpoint saving (`best.pt`, `last.pt`), `metrics.csv`, `test_metrics.json` and loss/accuracy/ATE curve images.
+- RGB/depth ImageFolder-style data loading, paired spatial preprocessing, train-time augmentation and evaluation preprocessing.
+- Random seed control, AdamW optimizer, cosine learning-rate schedule, gradient clipping, train/validation/test loops and checkpoint/metric export.
 
-## Quick smoke test
+## Dataset layout
 
-If you do not have a real dataset ready, run one epoch on synthetic data:
-
-```bash
-python causal_trans.py \
-  --epochs 1 \
-  --fake-size 32 \
-  --num-classes 5 \
-  --image-size 64 \
-  --batch-size 4 \
-  --workers 0 \
-  --device cpu \
-  --no-attention \
-  --output-dir runs/smoke
-```
-
-## Training on an ImageFolder dataset
-
-Expected layout follows `torchvision.datasets.ImageFolder`:
+FakeData support has been removed; `--data-root` is required.  The RGB directory follows `torchvision.datasets.ImageFolder` and supplies the multi-class outcome label `y`:
 
 ```text
-data_root/
+MTL/
   class0/
-    image_t0_0001.jpg
-    image_t1_0002.jpg
+    sample001_t0.png
+    sample002_t1.png
   class1/
-    image_t0_0003.jpg
-    image_t1_0004.jpg
+    sample003_t0.png
+    sample004_t1.png
 ```
 
-The parent directory supplies the multi-class outcome label `y`; for your `MTL/class0` ... `MTL/class4` layout, the code automatically detects `num_classes=5` and trains with multi-class cross-entropy.  Filenames or parent paths supply the binary treatment `t` when they contain `t0`, `t1`, `t=0`, `t=1`, `treatment0` or `treatment1`.  If no treatment marker is found, `t` defaults to `0`; use `--treatment-mode label-parity` only as a debugging fallback when your dataset has no treatment labels at all.
+Each RGB image must have a paired `.npy` depth map.  Two layouts are supported:
+
+1. **Depth next to RGB**: `MTL/class0/sample001_t0.png` pairs with `MTL/class0/sample001_t0.npy`.
+2. **Separate depth root**: pass `--depth-root /path/to/depth`; the code first tries the mirrored path, e.g. `/path/to/depth/class0/sample001_t0.npy`, then `/path/to/depth/sample001_t0.npy`.
+
+Filenames or parent paths supply the binary treatment `t` when they contain `t0`, `t1`, `t=0`, `t=1`, `treatment0` or `treatment1`.  If no treatment marker is found, `t` defaults to `0`; use `--treatment-mode label-parity` only as a debugging fallback when your dataset has no treatment labels at all.
+
+## Training
 
 ```bash
 python causal_trans.py \
   --data-root /path/to/MTL \
+  --depth-root /path/to/depth \
   --epochs 50 \
   --batch-size 32 \
   --image-size 128 \
   --pretrained-backbone \
-  --output-dir runs/tlt_experiment
+  --output-dir runs/tlt_rgb_depth
 ```
 
+If `.npy` depth files are stored next to the RGB images, omit `--depth-root`.
 
 ## Treatment-aware split policy
 
@@ -70,6 +60,7 @@ If you want only the training set to contain `t1`, pass `--no-split-t1-across-sp
 ```bash
 python causal_trans.py \
   --data-root /path/to/MTL \
+  --depth-root /path/to/depth \
   --no-split-t1-across-splits \
   --train-ratio 0.7 \
   --val-ratio 0.15 \
@@ -88,11 +79,12 @@ Each run writes the following files under `--output-dir`:
 
 ## Method correspondence
 
-The implementation follows the paper method section:
+The implementation follows the paper method section, with the requested RGB-depth extension:
 
-- the encoder estimates treatment and outcome auxiliary distributions before posterior inference;
-- attention uses query features from the selected treatment branch and key/value features from image features;
+- the RGB branch estimates treatment and outcome auxiliary distributions before posterior inference;
+- attention uses RGB treatment-query features as Query and depth features as Key/Value;
 - latent `z` is sampled by the reparameterization trick;
+- the prior is conditioned on depth features, so the KL term is `KL(q(z|x,t,y,depth) || p(z|depth))`;
 - the decoder predicts potential outcomes for both treatment arms, enabling batch-level ATE estimates with `mean(y1 - y0)`.
 
 ## Citation
